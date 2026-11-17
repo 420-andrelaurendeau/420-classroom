@@ -14,6 +14,9 @@ set -euo pipefail
 # Prevent Git Bash on Windows from converting /repos/... URL paths to filesystem paths
 export MSYS_NO_PATHCONV=1
 
+# Global config file path for use in helper functions
+CONFIG_FILE=""
+
 # ─── dependency check ────────────────────────────────────────────────────────
 
 check_deps() {
@@ -58,26 +61,60 @@ load_config() {
     while IFS= read -r line; do TEACHERS+=("$line"); done \
         < <(jq -r '.teachers[]' "$cfg" | tr -d '\r')
 
-    STUDENTS=()
-    while IFS= read -r line; do STUDENTS+=("$line"); done \
-        < <(jq -r '.students[]' "$cfg" | tr -d '\r')
+    # Check if it's a team project (projets) or individual assignment (students)
+    IS_TEAM_PROJECT=$(jq 'has("projets")' "$cfg")
 
-    if [[ "${#STUDENTS[@]}" -eq 0 ]]; then
-        echo "Error: no students found in config." >&2
-        exit 1
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        # Load team project structure
+        PROJECTS=()
+        while IFS= read -r line; do PROJECTS+=("$line"); done \
+            < <(jq -r '.projets[].name' "$cfg" | tr -d '\r')
+
+        if [[ "${#PROJECTS[@]}" -eq 0 ]]; then
+            echo "Error: no projects found in config." >&2
+            exit 1
+        fi
+    else
+        # Load individual student structure
+        STUDENTS=()
+        while IFS= read -r line; do STUDENTS+=("$line"); done \
+            < <(jq -r '.students[]' "$cfg" | tr -d '\r')
+
+        if [[ "${#STUDENTS[@]}" -eq 0 ]]; then
+            echo "Error: no students found in config." >&2
+            exit 1
+        fi
     fi
 }
 
 repo_name_for() {
-    echo "${PREFIX}${1}"
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        echo "${PREFIX}${1}"
+    else
+        echo "${PREFIX}${1}"
+    fi
+}
+
+get_project_students() {
+    local project_name="$1"
+    jq -r ".projets[] | select(.name==\"${project_name}\") | .students[]" "$CONFIG_FILE" | tr -d '\r'
 }
 
 # ─── create ──────────────────────────────────────────────────────────────────
-# Creates one private repo per student from the template.
-# Student → push (read/write, not admin).
-# All teachers → admin.
+# Creates repositories:
+# - For individual assignment: one repo per student
+# - For team project: one repo per project with multiple students
+# In both cases, students get write (read/write) access, teachers get admin.
 
 cmd_create() {
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        cmd_create_team_projects
+    else
+        cmd_create_individual
+    fi
+}
+
+cmd_create_individual() {
     echo "=== Creating student repositories ==="
     echo "    Org       : $ORG"
     echo "    Template  : $TEMPLATE_REPO  (branch: $BRANCH)"
@@ -121,11 +158,67 @@ cmd_create() {
     echo "=== Done ==="
 }
 
+cmd_create_team_projects() {
+    echo "=== Creating team project repositories ==="
+    echo "    Org       : $ORG"
+    echo "    Template  : $TEMPLATE_REPO  (branch: $BRANCH)"
+    echo "    Owner     : $OWNER"
+    echo ""
+
+    for PROJECT_NAME in "${PROJECTS[@]}"; do
+        REPO=$(repo_name_for "$PROJECT_NAME")
+        FULL_REPO="${ORG}/${REPO}"
+        URL="https://github.com/${FULL_REPO}"
+
+        echo "→ $FULL_REPO"
+
+        # Create from template only if it doesn't already exist
+        if gh repo view "$FULL_REPO" &>/dev/null; then
+            echo "  [skip] Repository already exists → $URL"
+        else
+            gh repo create "$FULL_REPO" \
+                --template "$TEMPLATE_REPO" \
+                --private \
+                --clone=false
+            echo "  [ok]   Created from template"
+        fi
+
+        # Grant each team member write (push) access
+        while IFS= read -r STUDENT; do
+            if [[ -n "$STUDENT" ]]; then
+                gh api --method PUT "/repos/${FULL_REPO}/collaborators/${STUDENT}" \
+                    -f permission=push > /dev/null
+                echo "  [ok]   ${STUDENT} → push"
+            fi
+        done < <(get_project_students "$PROJECT_NAME")
+
+        # Grant every teacher admin access
+        for TEACHER in "${TEACHERS[@]}"; do
+            gh api --method PUT "/repos/${FULL_REPO}/collaborators/${TEACHER}" \
+                -f permission=admin > /dev/null
+            echo "  [ok]   ${TEACHER} → admin"
+        done
+
+        echo "  URL: $URL"
+        echo ""
+    done
+
+    echo "=== Done ==="
+}
+
 # ─── report ──────────────────────────────────────────────────────────────────
-# Displays a table with commit count (by student), branches, and repo URL.
+# Displays a table with commit count, branches, and repo URL.
 # Note: commit count is capped at 100 per GitHub API page.
 
 cmd_report() {
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        cmd_report_team_projects
+    else
+        cmd_report_individual
+    fi
+}
+
+cmd_report_individual() {
     echo "=== Student Repository Report ==="
     echo "    Org    : $ORG"
     echo "    Prefix : $PREFIX"
@@ -155,11 +248,49 @@ cmd_report() {
     echo ""
 }
 
+cmd_report_team_projects() {
+    echo "=== Team Project Repository Report ==="
+    echo "    Org    : $ORG"
+    echo "    Prefix : $PREFIX"
+    echo ""
+    printf "%-40s %8s  %-35s  %s\n" "Repository" "Commits" "Branches" "URL"
+    printf "%-40s %8s  %-35s  %s\n" "─────────────────────────────────────────" "───────" "───────────────────────────────────" "───────────────────────────────────"
+
+    for PROJECT_NAME in "${PROJECTS[@]}"; do
+        REPO=$(repo_name_for "$PROJECT_NAME")
+        FULL_REPO="${ORG}/${REPO}"
+        URL="https://github.com/${FULL_REPO}"
+
+        # Total commit count in repo
+        COMMIT_COUNT=$(gh api \
+            "/repos/${FULL_REPO}/commits?per_page=100" \
+            --jq 'length' 2>/dev/null || echo "?")
+
+        # Branch names joined with ", "
+        BRANCHES=$(gh api \
+            "/repos/${FULL_REPO}/branches?per_page=100" \
+            --jq '[.[].name] | join(", ")' 2>/dev/null || echo "N/A")
+
+        printf "%-40s %8s  %-35s  %s\n" \
+            "$REPO" "$COMMIT_COUNT" "${BRANCHES:0:35}" "$URL"
+    done
+
+    echo ""
+}
+
 # ─── clone ───────────────────────────────────────────────────────────────────
-# Clones each student repo into CLONE_DIR (default: current directory).
+# Clones each repo into CLONE_DIR (default: current directory).
 # If the directory already exists, does a fast-forward pull instead.
 
 cmd_clone() {
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        cmd_clone_team_projects
+    else
+        cmd_clone_individual
+    fi
+}
+
+cmd_clone_individual() {
     local TARGET_DIR="$CLONE_DIR"
     echo "=== Cloning student repositories → '${TARGET_DIR}' ==="
     mkdir -p "$TARGET_DIR"
@@ -185,20 +316,53 @@ cmd_clone() {
     echo "=== Done ==="
 }
 
+cmd_clone_team_projects() {
+    local TARGET_DIR="$CLONE_DIR"
+    echo "=== Cloning team project repositories → '${TARGET_DIR}' ==="
+    mkdir -p "$TARGET_DIR"
+
+    for PROJECT_NAME in "${PROJECTS[@]}"; do
+        REPO=$(repo_name_for "$PROJECT_NAME")
+        FULL_REPO="${ORG}/${REPO}"
+        DEST="${TARGET_DIR}/${REPO}"
+
+        echo ""
+        echo "→ $REPO"
+
+        if [[ -d "${DEST}/.git" ]]; then
+            echo "  [exists] Pulling latest changes..."
+            git -C "$DEST" pull --ff-only
+        else
+            gh repo clone "$FULL_REPO" "$DEST"
+            echo "  [ok] Cloned → $DEST"
+        fi
+    done
+
+    echo ""
+    echo "=== Done ==="
+}
+
 # ─── sync ────────────────────────────────────────────────────────────────────
-# Merges new commits from the template into each student repo.
+# Merges new commits from the template into each repo.
 # Since repos are created from a template (not a fork), upstream must be
 # added manually. Uses a temporary directory — no permanent local clone needed.
 # Student's work is preserved; merge conflicts require manual resolution.
 
 cmd_sync() {
+    if [[ "$IS_TEAM_PROJECT" == "true" ]]; then
+        cmd_sync_team_projects
+    else
+        cmd_sync_individual
+    fi
+}
+
+cmd_sync_individual() {
     echo "=== Syncing student repos from template ==="
     echo "    Template : $TEMPLATE_URL  (branch: $BRANCH)"
     echo ""
 
     local WORK_DIR
     WORK_DIR=$(mktemp -d)
-    # Ensure cleanup even on error
     trap 'rm -rf "$WORK_DIR"' EXIT
 
     for STUDENT in "${STUDENTS[@]}"; do
@@ -208,15 +372,55 @@ cmd_sync() {
 
         echo "→ $FULL_REPO"
 
-        # Clone student repo quietly into temp dir
         gh repo clone "$FULL_REPO" "$LOCAL" -- --quiet
         pushd "$LOCAL" > /dev/null
 
-        # Add template as upstream
         git remote add upstream "$TEMPLATE_URL"
         git fetch upstream "$BRANCH" --quiet
 
-        # Attempt a non-fast-forward merge
+        if git merge "upstream/${BRANCH}" \
+                --no-edit \
+                -m "chore: sync updates from template ${TEMPLATE_REPO}@${BRANCH}"; then
+            git push origin "HEAD:${BRANCH}"
+            echo "  [ok] Synced and pushed"
+        else
+            echo "  [!]  Merge conflict in ${REPO} — aborting merge." >&2
+            echo "       Manual resolution required. Clone the repo and merge manually:" >&2
+            echo "         gh repo clone ${FULL_REPO} && cd ${REPO}" >&2
+            echo "         git remote add upstream ${TEMPLATE_URL}" >&2
+            echo "         git fetch upstream && git merge upstream/${BRANCH}" >&2
+            git merge --abort 2>/dev/null || true
+        fi
+
+        popd > /dev/null
+    done
+
+    echo ""
+    echo "=== Done ==="
+}
+
+cmd_sync_team_projects() {
+    echo "=== Syncing team project repos from template ==="
+    echo "    Template : $TEMPLATE_URL  (branch: $BRANCH)"
+    echo ""
+
+    local WORK_DIR
+    WORK_DIR=$(mktemp -d)
+    trap 'rm -rf "$WORK_DIR"' EXIT
+
+    for PROJECT_NAME in "${PROJECTS[@]}"; do
+        REPO=$(repo_name_for "$PROJECT_NAME")
+        FULL_REPO="${ORG}/${REPO}"
+        LOCAL="${WORK_DIR}/${REPO}"
+
+        echo "→ $FULL_REPO"
+
+        gh repo clone "$FULL_REPO" "$LOCAL" -- --quiet
+        pushd "$LOCAL" > /dev/null
+
+        git remote add upstream "$TEMPLATE_URL"
+        git fetch upstream "$BRANCH" --quiet
+
         if git merge "upstream/${BRANCH}" \
                 --no-edit \
                 -m "chore: sync updates from template ${TEMPLATE_REPO}@${BRANCH}"; then
